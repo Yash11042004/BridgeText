@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# FAISS vector store
+my_vector_store/
+LEGAL-DATA/

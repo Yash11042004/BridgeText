@@ -1,0 +1,33 @@
+# faiss-cpu
+# groq
+# langchain-groq
+# PyPDF2
+# langchain_google_genai
+# langchain
+# streamlit
+# langchain-openai
+# langchain_community
+# python-dotenv
+# pypdf
+
+faiss-cpu
+groq
+langchain-groq
+PyPDF2
+langchain_google_genai
+langchain
+langchain-openai
+langchain_community
+python-dotenv
+pypdf
+flask
+gunicorn
+twilio
+werkzeug
+tiktoken
+
+
+# conda create -p venv python==3.12
+# conda activate C:\Users\ASUS1\Downloads\Python_project\Legal-CHATBOT\venv
+# python ingestion.py
+# streamlit run app.py
