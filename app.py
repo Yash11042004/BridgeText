@@ -1,5 +1,7 @@
 # app.py (Flask-only WhatsApp bot, same functionality without Streamlit)
 import os
+import re
+import random
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -157,6 +159,14 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
     conversation_memory[user_id] = history
     return answer
 
+# --- Emoji reaction settings ---
+REACTION_EMOJIS = ["👍", "❤️", "✨", "😊", "🙌", "👏", "🔥", "🌟", "💯"]
+REACTION_PROBABILITY = 0.7  # 70% chance to react on trigger
+reacted_users = set()  # tracks users who've already received a reaction this server session
+
+GREETING_PATTERN = r'^(hi|hello|hey|hiya|yo|good (morning|afternoon|evening)|sup)[\s!,.!?]*$'
+THANKS_PATTERN = r'^(thanks|thank you|ty|thx|appreciate|cheers)[\s!,.!?]*$'
+
 # --- Flask app (WhatsApp webhook only) ---
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
@@ -182,8 +192,19 @@ def whatsapp_webhook():
         resp.message("👋 I didn’t receive any text. Please send a message.")
         return str(resp), 200
 
-    reply = generate_reply_for_input(from_number, incoming_msg)
     resp = MessagingResponse()
+
+    # only react on greeting/thanks triggers and only once per user per server session
+    if (re.match(GREETING_PATTERN, incoming_msg, re.IGNORECASE)
+            or re.match(THANKS_PATTERN, incoming_msg, re.IGNORECASE)):
+        if from_number not in reacted_users:
+            if random.random() < REACTION_PROBABILITY:
+                reaction = random.choice(REACTION_EMOJIS)
+                resp.message(reaction)
+                reacted_users.add(from_number)
+
+    # always add chatbot’s normal reply
+    reply = generate_reply_for_input(from_number, incoming_msg)
     resp.message(reply)
     return str(resp), 200
 
