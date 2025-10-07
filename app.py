@@ -269,23 +269,18 @@ def convert_to_mp3(input_path: str, output_path: str) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def transcribe_with_openai(audio_file_path: str) -> str:
-    """
-    Use OpenAI Whisper (openai.Audio.transcribe) to transcribe audio.
-    Returns transcript string or empty string on failure.
-    """
+    """Use gpt-4o-transcribe instead of whisper for STT."""
     if not OPENAI_API_KEY:
         print("OPENAI_API_KEY not set; cannot transcribe.")
         return ""
     try:
         with open(audio_file_path, "rb") as fh:
-            resp = openai.Audio.transcribe("whisper-1", fh)
-        # Try to extract text robustly
+            resp = openai.Audio.transcribe("gpt-4o-transcribe", fh)
         if isinstance(resp, dict):
             return resp.get("text", "") or resp.get("transcript", "") or ""
-        # Some client versions return an object with .text
         return getattr(resp, "text", "") or ""
     except Exception as e:
-        print("OpenAI transcription error:", e)
+        print("OpenAI transcription error (gpt-4o):", e)
         return ""
 
 # --- Flask app (WhatsApp webhook only) ---
