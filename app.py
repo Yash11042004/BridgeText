@@ -1,8 +1,9 @@
-# app.py (Flask WhatsApp bot — updated to support voice-note STT while preserving existing behavior)
+# app.py (full updated - voice-note STT, Twilio media auth, verbose logs, Whisper fallback)
 import os
 import tempfile
 import subprocess
 import requests
+import traceback
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -32,7 +33,6 @@ from langchain_openai import ChatOpenAI
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-# (Imports retained for parity with your previous file)
 from langchain_groq import ChatGroq  # noqa: F401
 
 # Vector store / retriever
@@ -244,13 +244,24 @@ def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 
     """
     Download media to dest_path.
     If auth is provided (username, password), requests will use HTTP Basic Auth.
+    This function prints fetch status and headers for debugging.
     """
-    with requests.get(url, auth=auth, stream=True, timeout=timeout) as resp:
+    print("Attempting media fetch:", url)
+    print("Using auth tuple provided:", bool(auth))
+    try:
+        resp = requests.get(url, auth=auth, stream=True, timeout=timeout)
+        print("Fetch status:", resp.status_code, "Content-Type:", resp.headers.get("Content-Type"), "Length:", resp.headers.get("Content-Length"))
         resp.raise_for_status()
         with open(dest_path, "wb") as f:
             for chunk in resp.iter_content(1024 * 10):
                 if chunk:
                     f.write(chunk)
+    except requests.HTTPError as he:
+        print("HTTPError while fetching media:", he)
+        raise
+    except Exception as e:
+        print("Error while fetching media:", e)
+        raise
 
 def convert_to_mp3(input_path: str, output_path: str) -> None:
     """
@@ -266,21 +277,44 @@ def convert_to_mp3(input_path: str, output_path: str) -> None:
         "-b:a", "128k",
         output_path,
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Allow ffmpeg stdout/stderr to appear in logs for easier debugging
+    subprocess.run(cmd, check=True)
 
 def transcribe_with_openai(audio_file_path: str) -> str:
-    """Use gpt-4o-transcribe instead of whisper for STT."""
+    """
+    Primary: try gpt-4o-transcribe.
+    Fallback: try whisper-1 (if available) on failure.
+    Returns transcript string or empty string on failure.
+    """
     if not OPENAI_API_KEY:
         print("OPENAI_API_KEY not set; cannot transcribe.")
         return ""
+    # Try gpt-4o-transcribe first
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai.Audio.transcribe("gpt-4o-transcribe", fh)
         if isinstance(resp, dict):
-            return resp.get("text", "") or resp.get("transcript", "") or ""
-        return getattr(resp, "text", "") or ""
+            text = resp.get("text") or resp.get("transcript") or ""
+        else:
+            text = getattr(resp, "text", "") or ""
+        if text:
+            return text
     except Exception as e:
-        print("OpenAI transcription error (gpt-4o):", e)
+        print("gpt-4o-transcribe error:", repr(e))
+        traceback.print_exc()
+
+    # Whisper fallback
+    try:
+        with open(audio_file_path, "rb") as fh:
+            resp = openai.Audio.transcribe("whisper-1", fh)
+        if isinstance(resp, dict):
+            text = resp.get("text") or resp.get("transcript") or ""
+        else:
+            text = getattr(resp, "text", "") or ""
+        return text or ""
+    except Exception as e:
+        print("whisper fallback error:", repr(e))
+        traceback.print_exc()
         return ""
 
 # --- Flask app (WhatsApp webhook only) ---
@@ -304,6 +338,16 @@ def whatsapp_webhook():
     incoming_msg = (request.form.get("Body") or "").strip()
     num_media = int(request.form.get("NumMedia", "0"))
 
+    # Debug prints to confirm webhook structure
+    print("Incoming message from:", from_number)
+    print("Incoming text body present:", bool(incoming_msg))
+    print("NumMedia:", num_media)
+    try:
+        media_keys_preview = {k: request.form.get(k) for k in request.form.keys() if k.startswith("Media")}
+    except Exception:
+        media_keys_preview = {}
+    print("Media keys preview:", media_keys_preview)
+
     user_input = None
 
     # If there's media, attempt to handle audio (voice note)
@@ -313,14 +357,30 @@ def whatsapp_webhook():
         print(f"Incoming media from {from_number}: url={media_url} content_type={media_content_type}")
 
         try:
+            # debug: show incoming form keys and webhook account
+            try:
+                form_keys = list(request.form.keys())
+            except Exception:
+                form_keys = []
+            print("Request form keys:", form_keys)
+            webhook_account = request.form.get("AccountSid")
+            print("Webhook AccountSid:", webhook_account)
+            print("TW auth present in env:", bool(TWILIO_ACCOUNT_SID), bool(TWILIO_AUTH))
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 raw_path = os.path.join(tmpdir, "incoming_media")
-                # Determine auth for Twilio-hosted media: Twilio requires basic auth with Account SID + Auth Token
-                auth = None
-                if TWILIO_ACCOUNT_SID and TWILIO_AUTH:
-                    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH)
 
-                # Download media
+                # Force Basic Auth for Twilio-hosted media URLs
+                auth = None
+                sid_to_use = TWILIO_ACCOUNT_SID or webhook_account
+                if media_url and "api.twilio.com" in media_url:
+                    if sid_to_use and TWILIO_AUTH:
+                        auth = (sid_to_use, TWILIO_AUTH)
+                        print("Using Twilio Basic Auth for media fetch with SID:", sid_to_use)
+                    else:
+                        print("Twilio media URL detected but TWILIO_ACCOUNT_SID or TWILIO_AUTH missing. Attempting unauthenticated fetch.")
+
+                # Download media (will print status inside download_media)
                 download_media(media_url, raw_path, auth=auth)
                 if DEBUG_SAVE_MEDIA:
                     debug_dir = os.path.join(os.getcwd(), "debug_media")
@@ -328,7 +388,7 @@ def whatsapp_webhook():
                     debug_raw = os.path.join(debug_dir, f"{from_number.replace(':','_')}_raw")
                     with open(raw_path, "rb") as rfh, open(debug_raw, "wb") as wfh:
                         wfh.write(rfh.read())
-                    print("Saved raw media to debug_media")
+                    print("Saved raw media to debug_media:", debug_raw)
 
                 # First attempt: try direct transcription (some formats may work)
                 transcription = transcribe_with_openai(raw_path)
@@ -343,25 +403,28 @@ def whatsapp_webhook():
                             debug_mp3 = os.path.join(os.getcwd(), "debug_media", f"{from_number.replace(':','_')}_converted.mp3")
                             with open(mp3_path, "rb") as rfh, open(debug_mp3, "wb") as wfh:
                                 wfh.write(rfh.read())
-                            print("Saved converted mp3 to debug_media")
+                            print("Saved converted mp3 to debug_media:", debug_mp3)
                     except subprocess.CalledProcessError as ce:
                         print("ffmpeg conversion failed:", ce)
+                        traceback.print_exc()
                         # try wav fallback
                         try:
                             wav_path = os.path.join(tmpdir, "converted.wav")
                             cmd = ["ffmpeg", "-y", "-i", raw_path, "-ar", "16000", "-ac", "1", wav_path]
-                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            subprocess.run(cmd, check=True)
                             transcription = transcribe_with_openai(wav_path)
                             if DEBUG_SAVE_MEDIA and transcription:
                                 debug_wav = os.path.join(os.getcwd(), "debug_media", f"{from_number.replace(':','_')}_converted.wav")
                                 with open(wav_path, "rb") as rfh, open(debug_wav, "wb") as wfh:
                                     wfh.write(rfh.read())
-                                print("Saved converted wav to debug_media")
+                                print("Saved converted wav to debug_media:", debug_wav)
                         except Exception as e:
                             print("Fallback conversion/transcription failed:", e)
+                            traceback.print_exc()
                             transcription = None
                     except Exception as e:
                         print("Conversion error:", e)
+                        traceback.print_exc()
                         transcription = None
 
             # Decide what to pass to the pipeline
@@ -373,7 +436,8 @@ def whatsapp_webhook():
                 user_input = "[voice message received but could not transcribe]"
                 print("Transcription empty or failed; using placeholder input")
         except Exception as e:
-            print("Error processing incoming media:", e)
+            print("Error processing incoming media:", repr(e))
+            traceback.print_exc()
             user_input = "[error processing voice message]"
     else:
         user_input = incoming_msg
