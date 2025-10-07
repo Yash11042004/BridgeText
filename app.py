@@ -1,4 +1,5 @@
-# app.py (full updated - voice-note STT, Twilio media auth, verbose logs, Whisper fallback)
+# app.py (full updated - fixes OpenAI Python v1+ usage for transcription, voice-note STT,
+# Twilio media auth, verbose logs, Whisper fallback; paste/replace your existing file)
 import os
 import tempfile
 import subprocess
@@ -20,10 +21,18 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")  # optional, used for f
 TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "true").lower() == "true"
 DEBUG_SAVE_MEDIA = os.getenv("DEBUG_SAVE_MEDIA", "false").lower() == "true"
 
-# --- OpenAI client (for STT) ---
-import openai
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# --- New OpenAI client (v1+ openai-python) ---
+# This uses the new interface: from openai import OpenAI; client = OpenAI()
+openai_client = None
+try:
+    from openai import OpenAI
+    if OPENAI_API_KEY:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    else:
+        openai_client = OpenAI()
+except Exception as e:
+    print("Could not initialize OpenAI v1 client:", repr(e))
+    openai_client = None
 
 # --- RAG pipeline (unchanged core logic) ---
 from langchain_community.vectorstores import FAISS
@@ -40,7 +49,7 @@ embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
 db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
-# Prompt (kept identical)
+# Prompt (kept identical - paste your full prompt if truncated)
 prompt_template = """
 <s>[INST]Master Prompt for STEP + 4Rs Chatbot
 
@@ -277,26 +286,26 @@ def convert_to_mp3(input_path: str, output_path: str) -> None:
         "-b:a", "128k",
         output_path,
     ]
-    # Allow ffmpeg stdout/stderr to appear in logs for easier debugging
     subprocess.run(cmd, check=True)
 
 def transcribe_with_openai(audio_file_path: str) -> str:
     """
-    Primary: try gpt-4o-transcribe.
-    Fallback: try whisper-1 (if available) on failure.
+    Use OpenAI v1 client for transcription.
+    Primary: gpt-4o-transcribe (if available).
+    Fallback: whisper-1.
     Returns transcript string or empty string on failure.
     """
-    if not OPENAI_API_KEY:
-        print("OPENAI_API_KEY not set; cannot transcribe.")
+    if not openai_client:
+        print("openai_client not initialized; cannot transcribe.")
         return ""
-    # Try gpt-4o-transcribe first
+
+    # Try primary model: gpt-4o-transcribe
     try:
         with open(audio_file_path, "rb") as fh:
-            resp = openai.Audio.transcribe("gpt-4o-transcribe", fh)
-        if isinstance(resp, dict):
-            text = resp.get("text") or resp.get("transcript") or ""
-        else:
-            text = getattr(resp, "text", "") or ""
+            # new client: client.audio.transcriptions.create(...)
+            resp = openai_client.audio.transcriptions.create(model="gpt-4o-transcribe", file=fh)
+        # resp is usually a dict-like object with 'text'
+        text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
         if text:
             return text
     except Exception as e:
@@ -306,11 +315,8 @@ def transcribe_with_openai(audio_file_path: str) -> str:
     # Whisper fallback
     try:
         with open(audio_file_path, "rb") as fh:
-            resp = openai.Audio.transcribe("whisper-1", fh)
-        if isinstance(resp, dict):
-            text = resp.get("text") or resp.get("transcript") or ""
-        else:
-            text = getattr(resp, "text", "") or ""
+            resp = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
+        text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
         return text or ""
     except Exception as e:
         print("whisper fallback error:", repr(e))
