@@ -1,5 +1,8 @@
-# app.py (Flask-only WhatsApp bot, same functionality without Streamlit)
+# app.py (Flask WhatsApp bot — updated to support voice-note STT while preserving existing behavior)
 import os
+import tempfile
+import subprocess
+import requests
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -12,7 +15,14 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH", "")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")  # optional, used for fetching Twilio-hosted media if needed
 TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "true").lower() == "true"
+DEBUG_SAVE_MEDIA = os.getenv("DEBUG_SAVE_MEDIA", "false").lower() == "true"
+
+# --- OpenAI client (for STT) ---
+import openai
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
 # --- RAG pipeline (unchanged core logic) ---
 from langchain_community.vectorstores import FAISS
@@ -229,6 +239,55 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
     conversation_memory[user_id] = history
     return answer
 
+# --- Helpers for audio download, conversion, transcription ---
+def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30) -> None:
+    """
+    Download media to dest_path.
+    If auth is provided (username, password), requests will use HTTP Basic Auth.
+    """
+    with requests.get(url, auth=auth, stream=True, timeout=timeout) as resp:
+        resp.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(1024 * 10):
+                if chunk:
+                    f.write(chunk)
+
+def convert_to_mp3(input_path: str, output_path: str) -> None:
+    """
+    Convert any input audio to an mp3 with settings friendly for STT (16k mono).
+    Requires ffmpeg installed and available on PATH.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-ar", "16000",
+        "-ac", "1",
+        "-b:a", "128k",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def transcribe_with_openai(audio_file_path: str) -> str:
+    """
+    Use OpenAI Whisper (openai.Audio.transcribe) to transcribe audio.
+    Returns transcript string or empty string on failure.
+    """
+    if not OPENAI_API_KEY:
+        print("OPENAI_API_KEY not set; cannot transcribe.")
+        return ""
+    try:
+        with open(audio_file_path, "rb") as fh:
+            resp = openai.Audio.transcribe("whisper-1", fh)
+        # Try to extract text robustly
+        if isinstance(resp, dict):
+            return resp.get("text", "") or resp.get("transcript", "") or ""
+        # Some client versions return an object with .text
+        return getattr(resp, "text", "") or ""
+    except Exception as e:
+        print("OpenAI transcription error:", e)
+        return ""
+
 # --- Flask app (WhatsApp webhook only) ---
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
@@ -246,15 +305,92 @@ def whatsapp_webhook():
         if not validator.validate(request.url, request.form, signature):
             return ("Invalid signature", 403)
 
-    incoming_msg = (request.form.get("Body") or "").strip()
     from_number = request.form.get("From", "anonymous")  # e.g. "whatsapp:+16084716735"
+    incoming_msg = (request.form.get("Body") or "").strip()
+    num_media = int(request.form.get("NumMedia", "0"))
 
-    if not incoming_msg:
+    user_input = None
+
+    # If there's media, attempt to handle audio (voice note)
+    if num_media and num_media > 0:
+        media_url = request.form.get("MediaUrl0")
+        media_content_type = request.form.get("MediaContentType0", "").lower()
+        print(f"Incoming media from {from_number}: url={media_url} content_type={media_content_type}")
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                raw_path = os.path.join(tmpdir, "incoming_media")
+                # Determine auth for Twilio-hosted media: Twilio requires basic auth with Account SID + Auth Token
+                auth = None
+                if TWILIO_ACCOUNT_SID and TWILIO_AUTH:
+                    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH)
+
+                # Download media
+                download_media(media_url, raw_path, auth=auth)
+                if DEBUG_SAVE_MEDIA:
+                    debug_dir = os.path.join(os.getcwd(), "debug_media")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    debug_raw = os.path.join(debug_dir, f"{from_number.replace(':','_')}_raw")
+                    with open(raw_path, "rb") as rfh, open(debug_raw, "wb") as wfh:
+                        wfh.write(rfh.read())
+                    print("Saved raw media to debug_media")
+
+                # First attempt: try direct transcription (some formats may work)
+                transcription = transcribe_with_openai(raw_path)
+
+                # If direct transcription failed, try convert to mp3 and transcribe again
+                if not transcription:
+                    mp3_path = os.path.join(tmpdir, "converted.mp3")
+                    try:
+                        convert_to_mp3(raw_path, mp3_path)
+                        transcription = transcribe_with_openai(mp3_path)
+                        if DEBUG_SAVE_MEDIA and transcription:
+                            debug_mp3 = os.path.join(os.getcwd(), "debug_media", f"{from_number.replace(':','_')}_converted.mp3")
+                            with open(mp3_path, "rb") as rfh, open(debug_mp3, "wb") as wfh:
+                                wfh.write(rfh.read())
+                            print("Saved converted mp3 to debug_media")
+                    except subprocess.CalledProcessError as ce:
+                        print("ffmpeg conversion failed:", ce)
+                        # try wav fallback
+                        try:
+                            wav_path = os.path.join(tmpdir, "converted.wav")
+                            cmd = ["ffmpeg", "-y", "-i", raw_path, "-ar", "16000", "-ac", "1", wav_path]
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            transcription = transcribe_with_openai(wav_path)
+                            if DEBUG_SAVE_MEDIA and transcription:
+                                debug_wav = os.path.join(os.getcwd(), "debug_media", f"{from_number.replace(':','_')}_converted.wav")
+                                with open(wav_path, "rb") as rfh, open(debug_wav, "wb") as wfh:
+                                    wfh.write(rfh.read())
+                                print("Saved converted wav to debug_media")
+                        except Exception as e:
+                            print("Fallback conversion/transcription failed:", e)
+                            transcription = None
+                    except Exception as e:
+                        print("Conversion error:", e)
+                        transcription = None
+
+            # Decide what to pass to the pipeline
+            if transcription and transcription.strip():
+                user_input = transcription.strip()
+                print(f"Transcription successful: {user_input}")
+            else:
+                # If transcription not available, optionally ask user to re-send text or pass a placeholder
+                user_input = "[voice message received but could not transcribe]"
+                print("Transcription empty or failed; using placeholder input")
+        except Exception as e:
+            print("Error processing incoming media:", e)
+            user_input = "[error processing voice message]"
+    else:
+        user_input = incoming_msg
+
+    # If still no input (empty text and no media), keep previous behavior
+    if not user_input:
         resp = MessagingResponse()
         resp.message("👋 I didn’t receive any text. Please send a message.")
         return str(resp), 200
 
-    reply = generate_reply_for_input(from_number, incoming_msg)
+    # Pass user_input to existing pipeline and respond
+    reply = generate_reply_for_input(from_number, user_input)
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp), 200
@@ -266,4 +402,5 @@ def whatsapp_status():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
+    # Bind to 0.0.0.0 for Render / external access
     app.run(host="0.0.0.0", port=port, debug=False)
