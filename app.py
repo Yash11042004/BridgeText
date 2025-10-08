@@ -198,7 +198,7 @@ QUESTION: {question}
 ANSWER:
 </s>[INST]
 """
-prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
+prompt = PromptTemplate(template=prompt_template, input_variables=["context", "input", "chat_history"])
 llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
 
 contextualize_q_prompt = ChatPromptTemplate.from_messages(
