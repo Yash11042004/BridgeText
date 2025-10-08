@@ -1,4 +1,4 @@
-# app.py (full updated with Twilio + Meta support, transcription, RAG, conversation memory)
+# app.py (full updated with Twilio + Meta support, transcription, RAG, conversation memory, and Meta reaction)
 import os
 import tempfile
 import subprocess
@@ -248,19 +248,12 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
 
 # --- Helpers for audio download, conversion, transcription ---
 def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30) -> None:
-    print("Attempting media fetch:", url)
-    print("Using auth tuple provided:", bool(auth))
-    try:
-        resp = requests.get(url, auth=auth, stream=True, timeout=timeout)
-        print("Fetch status:", resp.status_code, "Content-Type:", resp.headers.get("Content-Type"), "Length:", resp.headers.get("Content-Length"))
-        resp.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(1024 * 10):
-                if chunk:
-                    f.write(chunk)
-    except Exception as e:
-        print("Error while fetching media:", e)
-        raise
+    resp = requests.get(url, auth=auth, stream=True, timeout=timeout)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(10240):
+            if chunk:
+                f.write(chunk)
 
 def convert_to_mp3(input_path: str, output_path: str) -> None:
     cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", "-b:a", "128k", output_path]
@@ -268,23 +261,40 @@ def convert_to_mp3(input_path: str, output_path: str) -> None:
 
 def transcribe_with_openai(audio_file_path: str) -> str:
     if not openai_client:
-        print("openai_client not initialized; cannot transcribe.")
         return ""
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai_client.audio.transcriptions.create(model="gpt-4o-transcribe", file=fh)
         text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
         if text: return text
-    except Exception as e:
-        print("gpt-4o-transcribe error:", repr(e))
+    except Exception:
+        pass
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
         text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
         return text or ""
-    except Exception as e:
-        print("whisper fallback error:", repr(e))
+    except Exception:
         return ""
+
+# --- Meta WhatsApp reaction helper ---
+def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_number_id: str, access_token: str):
+    url = f"https://graph.facebook.com/v17.0/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "reaction",
+        "reaction": {"message_id": message_id, "emoji": emoji},
+    }
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+    print(f"Sent reaction {emoji} to {to_number} for message {message_id}")
+
+def should_react_with_heart(user_input: str) -> bool:
+    triggers = ["hi", "hello", "hey", "my name is"]
+    return any(trigger in user_input.lower() for trigger in triggers)
 
 # --- Flask app ---
 app = Flask(__name__)
@@ -307,37 +317,20 @@ def whatsapp_webhook():
     incoming_msg = (request.form.get("Body") or "").strip()
     num_media = int(request.form.get("NumMedia", "0"))
 
-    print("Incoming Twilio message from:", from_number, "NumMedia:", num_media)
     user_input = None
-
     if num_media > 0:
         media_url = request.form.get("MediaUrl0")
-        media_content_type = request.form.get("MediaContentType0", "").lower()
-        print(f"Incoming media: url={media_url} content_type={media_content_type}")
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 raw_path = os.path.join(tmpdir, "incoming_media")
-                auth = None
-                sid_to_use = TWILIO_ACCOUNT_SID or request.form.get("AccountSid")
-                if media_url and "api.twilio.com" in media_url and sid_to_use and TWILIO_AUTH:
-                    auth = (sid_to_use, TWILIO_AUTH)
-                download_media(media_url, raw_path, auth=auth)
-                if DEBUG_SAVE_MEDIA:
-                    debug_dir = os.path.join(os.getcwd(), "debug_media")
-                    os.makedirs(debug_dir, exist_ok=True)
-                    debug_raw = os.path.join(debug_dir, f"{from_number.replace(':','_')}_raw")
-                    with open(raw_path, "rb") as rfh, open(debug_raw, "wb") as wfh:
-                        wfh.write(rfh.read())
-                    print("Saved raw media to debug_media:", debug_raw)
+                download_media(media_url, raw_path)
                 transcription = transcribe_with_openai(raw_path)
                 if not transcription:
                     mp3_path = os.path.join(tmpdir, "converted.mp3")
                     convert_to_mp3(raw_path, mp3_path)
                     transcription = transcribe_with_openai(mp3_path)
                 user_input = transcription or "[voice message received but could not transcribe]"
-        except Exception as e:
-            print("Error processing media:", e)
-            traceback.print_exc()
+        except Exception:
             user_input = "[error processing voice message]"
     else:
         user_input = incoming_msg
@@ -377,7 +370,8 @@ def meta_webhook():
                     value = change.get("value", {})
                     messages = value.get("messages", [])
                     for msg in messages:
-                        from_number = msg.get("from") or msg.get("recipient_id") or "anonymous"
+                        from_number = msg.get("from") or "anonymous"
+                        message_id = msg.get("id")
                         user_input = None
 
                         if msg.get("type") == "text":
@@ -392,29 +386,38 @@ def meta_webhook():
                                 if media_link:
                                     with tempfile.TemporaryDirectory() as tmpdir:
                                         raw_path = os.path.join(tmpdir, "voice.ogg")
-                                        download_media(media_link, raw_path, auth=None)
+                                        download_media(media_link, raw_path)
                                         mp3_path = os.path.join(tmpdir, "voice.mp3")
                                         convert_to_mp3(raw_path, mp3_path)
                                         user_input = transcribe_with_openai(mp3_path)
-                            except Exception as e:
-                                print("Error fetching/transcribing Meta media:", e)
+                            except Exception:
                                 user_input = "[voice message received but could not transcribe]"
 
                         if user_input:
-                            reply_text = generate_reply_for_input(from_number, user_input)
-                            if META_PHONE_NUMBER_ID and META_ACCESS_TOKEN:
-                                send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
-                                payload = {
-                                    "messaging_product": "whatsapp",
-                                    "to": from_number,
-                                    "text": {"body": reply_text},
-                                }
-                                headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+                            # --- React if needed ---
+                            if should_react_with_heart(user_input):
                                 try:
-                                    resp = requests.post(send_url, json=payload, headers=headers)
-                                    print("Meta reply sent:", resp.status_code, resp.text)
+                                    send_whatsapp_reaction(
+                                        from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
+                                    )
                                 except Exception as e:
-                                    print("Error sending Meta reply:", e)
+                                    print("Error sending reaction:", e)
+
+                            # --- Generate LLM reply ---
+                            reply_text = generate_reply_for_input(from_number, user_input)
+                            send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
+                            payload = {
+                                "messaging_product": "whatsapp",
+                                "to": from_number,
+                                "text": {"body": reply_text},
+                            }
+                            headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+                            try:
+                                resp = requests.post(send_url, json=payload, headers=headers)
+                                print("Meta reply sent:", resp.status_code, resp.text)
+                            except Exception as e:
+                                print("Error sending Meta reply:", e)
+
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         print("Error in Meta webhook:", e)
