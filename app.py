@@ -419,13 +419,19 @@ def meta_webhook():
                         # Handle different incoming message types
                         if msg.get("type") == "text":
                             user_input = msg["text"]["body"].strip()
-                            # If initial greeting detected -> send emoji then interactive tone choice
+                            # If initial greeting detected -> react with heart then interactive tone choice
                             if user_input.lower() in ("hi", "hello", "hey"):
-                                # send a quick like (emoji) as plain text
                                 try:
-                                    send_meta_text(from_number, "👍")
+                                    # Prefer sending an actual WhatsApp reaction (heart) to the incoming message
+                                    if message_id:
+                                        send_whatsapp_reaction(
+                                            from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
+                                        )
+                                    else:
+                                        # Fallback: send a short heart text if message_id is missing
+                                        send_meta_text(from_number, "❤️")
                                 except Exception as e:
-                                    print("Error sending like:", e)
+                                    print("Error sending reaction on greeting:", e)
                                 # send interactive tone selection (Meta only)
                                 try:
                                     send_meta_interactive_tone_choice(from_number)
