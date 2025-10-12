@@ -1,4 +1,4 @@
-# app.py (full updated with Twilio + Meta support, transcription, RAG, conversation memory, and Meta reaction)
+# app.py (updated: Meta-only interactive template for tone selection + tone-aware replies)
 import os
 import tempfile
 import subprocess
@@ -225,12 +225,18 @@ qa_chat_prompt = ChatPromptTemplate.from_messages(
 question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
 qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-# Conversation memory
+# Conversation memory and tone preferences
 conversation_memory = {}
+tone_preferences = {}  # maps user_id -> "professional" | "casual"
 
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
+    # Inject tone into the model input so replies respect the selected tone (if any)
+    tone = tone_preferences.get(user_id)
+    effective_input = user_input
+    if tone:
+        effective_input = f"[TONE: {tone}]\n{user_input}"
     chat_history_for_chain = conversation_memory.get(user_id, [])
-    result = qa.invoke({"input": user_input, "chat_history": chat_history_for_chain})
+    result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
     answer = (
         result.get("answer")
         or result.get("output_text")
@@ -277,7 +283,7 @@ def transcribe_with_openai(audio_file_path: str) -> str:
     except Exception:
         return ""
 
-# --- Meta WhatsApp reaction helper ---
+# --- Meta WhatsApp helpers ---
 def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_number_id: str, access_token: str):
     url = f"https://graph.facebook.com/v17.0/{phone_number_id}/messages"
     payload = {
@@ -295,6 +301,42 @@ def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_nu
 def should_react_with_heart(user_input: str) -> bool:
     triggers = ["hi", "hello", "hey", "my name is"]
     return any(trigger in user_input.lower() for trigger in triggers)
+
+def send_meta_text(to_number: str, text: str):
+    url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
+    payload = {"messaging_product": "whatsapp", "to": to_number, "text": {"body": text}}
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    resp = requests.post(url, json=payload, headers=headers)
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        print("Error sending meta text:", resp.status_code, resp.text, e)
+    return resp
+
+def send_meta_interactive_tone_choice(to_number: str):
+    url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "Would you like replies in a Professional or Casual tone?"},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "tone_professional", "title": "Professional"}},
+                    {"type": "reply", "reply": {"id": "tone_casual", "title": "Casual"}},
+                ]
+            },
+        },
+    }
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    resp = requests.post(url, json=payload, headers=headers)
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        print("Error sending meta interactive:", resp.status_code, resp.text, e)
+    return resp
 
 # --- Flask app ---
 app = Flask(__name__)
@@ -374,14 +416,32 @@ def meta_webhook():
                         message_id = msg.get("id")
                         user_input = None
 
+                        # Handle different incoming message types
                         if msg.get("type") == "text":
-                            user_input = msg["text"]["body"]
+                            user_input = msg["text"]["body"].strip()
+                            # If initial greeting detected -> send emoji then interactive tone choice
+                            if user_input.lower() in ("hi", "hello", "hey"):
+                                # send a quick like (emoji) as plain text
+                                try:
+                                    send_meta_text(from_number, "👍")
+                                except Exception as e:
+                                    print("Error sending like:", e)
+                                # send interactive tone selection (Meta only)
+                                try:
+                                    send_meta_interactive_tone_choice(from_number)
+                                except Exception as e:
+                                    print("Error sending interactive tone choice:", e)
+                                # do not proceed to LLM reply for this greeting message
+                                continue
+
+                        # audio/voice handling (existing flow)
                         elif msg.get("type") in ("audio", "voice"):
                             media_id = msg[msg["type"]]["id"]
-                            media_url = f"https://graph.facebook.com/v17.0/{media_id}"
-                            headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+                            # fetch media URL via Graph API (two-step)
                             try:
-                                media_resp = requests.get(media_url, headers=headers).json()
+                                media_url_fetch = f"https://graph.facebook.com/v17.0/{media_id}"
+                                headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+                                media_resp = requests.get(media_url_fetch, headers=headers).json()
                                 media_link = media_resp.get("url")
                                 if media_link:
                                     with tempfile.TemporaryDirectory() as tmpdir:
@@ -393,15 +453,48 @@ def meta_webhook():
                             except Exception:
                                 user_input = "[voice message received but could not transcribe]"
 
+                        # Button / interactive reply handling (user chose Professional/Casual)
+                        # New: check for interactive button reply payloads
+                        interactive = msg.get("interactive")
+                        if interactive:
+                            i_type = interactive.get("type")
+                            # button_reply is common when user taps a reply button
+                            if i_type == "button_reply":
+                                br = interactive.get("button_reply", {})
+                                button_id = br.get("id", "")
+                                button_title = br.get("title", "").lower()
+                                chosen_tone = None
+                                if "professional" in button_id or "professional" in button_title:
+                                    chosen_tone = "professional"
+                                elif "casual" in button_id or "casual" in button_title:
+                                    chosen_tone = "casual"
+                                if chosen_tone:
+                                    tone_preferences[from_number] = chosen_tone
+                                    # acknowledge to user and prompt next step
+                                    try:
+                                        send_meta_text(
+                                            from_number,
+                                            f"Got it — I'll reply in a {chosen_tone.capitalize()} tone. How can I help today?",
+                                        )
+                                    except Exception as e:
+                                        print("Error sending tone acknowledgement:", e)
+                                    # do not pass this interactive payload to LLM
+                                    continue
+
+                        # If we still don't have user_input (e.g., non-greeting text or after audio)
+                        if not user_input:
+                            # fallback for other types (e.g., locations, stickers) - skip
+                            user_input = None
+
                         if user_input:
                             # --- React if needed ---
-                            if should_react_with_heart(user_input):
-                                try:
+                            try:
+                                if should_react_with_heart(user_input):
                                     send_whatsapp_reaction(
                                         from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
                                     )
-                                except Exception as e:
-                                    print("Error sending reaction:", e)
+                            except Exception as e:
+                                print("Error sending reaction:", e)
 
                             # --- Generate LLM reply ---
                             reply_text = generate_reply_for_input(from_number, user_input)
