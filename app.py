@@ -17,7 +17,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH", "")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "true").lower() == "true"
 DEBUG_SAVE_MEDIA = os.getenv("DEBUG_SAVE_MEDIA", "false").lower() == "true"
 
@@ -420,8 +420,8 @@ def whatsapp_webhook():
                     raw_path = os.path.join(tmpdir, f"incoming_media{ext}")
                     # Twilio media URLs often require HTTP Basic auth with account SID and auth token
                     auth_tuple = None
-                    if TWILIO_ACCOUNT_SID and TWILIO_AUTH:
-                        auth_tuple = (TWILIO_ACCOUNT_SID, TWILIO_AUTH)
+                    if TWILIO_SID and TWILIO_AUTH:
+                        auth_tuple = (TWILIO_SID, TWILIO_AUTH)
                     download_media(media_url, raw_path, auth=auth_tuple)
                     transcription = transcribe_with_openai(raw_path)
                     if not transcription:
