@@ -1,10 +1,12 @@
-# app.py (updated + improved media handling, logging, and fallbacks)
+# app.py (full updated: robust Twilio/Meta media handling, auth sanitization, detailed logging)
 import os
 import tempfile
 import subprocess
 import requests
 import traceback
 import logging
+import base64
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -14,22 +16,34 @@ from dotenv import load_dotenv
 # --- Load environment ---
 load_dotenv()
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TWILIO_AUTH = os.getenv("TWILIO_AUTH", "")
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# Accept multiple env names and sanitize (strip quotes/spaces)
+TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or os.getenv("TWILIO_SID") or "").strip()
+TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or os.getenv("TWILIO_AUTH") or os.getenv("TWILIO_AUTH_TOKEN".upper()) or "").strip()
+
+# Backwards-compat aliases
+TWILIO_SID = TWILIO_ACCOUNT_SID
+TWILIO_AUTH = TWILIO_AUTH_TOKEN
+
 TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "true").lower() == "true"
 DEBUG_SAVE_MEDIA = os.getenv("DEBUG_SAVE_MEDIA", "false").lower() == "true"
 
 # Meta WhatsApp cloud env
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "stepbot_verify")
-META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
+META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "").strip()
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
 
 # logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("whatsapp-bot")
+
+# quick runtime debug about Twilio env presence (does not log secrets)
+logger.info("TWILIO_ACCOUNT_SID present: %s", bool(TWILIO_ACCOUNT_SID))
+logger.info("TWILIO_AUTH_TOKEN present: %s", bool(TWILIO_AUTH_TOKEN))
+logger.info("TWILIO_AUTH_TOKEN length: %s", len(TWILIO_AUTH_TOKEN or ""))
 
 # --- OpenAI client (v1+) ---
 openai_client = None
@@ -61,12 +75,11 @@ try:
     logger.info("Vector store loaded")
 except Exception as e:
     logger.exception("Error initializing vector store or langchain modules: %s", e)
-    # allow rest of app to run even if RAG setup failed
     embeddings = None
     db = None
     db_retriever = None
 
-# Prompt template
+# Prompt template (keep full prompt text as needed)
 prompt_template = """
 <s>[INST]Master Prompt for STEP + 4Rs Chatbot
 
@@ -159,54 +172,16 @@ Good Examples (Concise, Natural):
 ✅ "Yeah, that would stress anyone out. What part feels hardest for you?"
 ✅ "I get why you're frustrated. Sounds like your manager's style is really different from what you're used to."
 ✅ "That's a tough spot to be in. Would it help to work through a method for handling situations like this?"
-Response Variety Patterns
-Don't always end with questions. Mix it up:
-Statement + Question
-"That sounds really frustrating. What's been the hardest part?"
-Just a Statement
-"I can see why that would make you anxious about work."
-Observation + Statement
-"Sounds like you're dealing with a lot of uncertainty. That would stress anyone out."
-Question Only (occasionally)
-"How long has this been going on?"
-Validation + Suggestion
-"That's a tough situation. Would it help to try a structured approach to this?"
-Make It Feel Human
-Use Natural Language:
-"That sucks" instead of "That sounds challenging"
-"Yeah, that's tough" instead of "I can understand your frustration"
-"Makes sense" instead of "That's completely understandable"
-"I get it" instead of "I can see why you feel that way"
-Drop Unnecessary Words:
-❌ "I can definitely understand why that would be frustrating for you"
-✅ "Yeah, that's frustrating"
-Don't Over-Validate:
-❌ "That's completely understandable and valid and anyone would feel exactly the same way"
-✅ "Anyone would feel that way"
-Framework Application - Stay Concise
-When Introducing Frameworks:
-❌ "This sounds like it's really about adapting to significant workplace changes and building your skills around flexibility and resilience in the face of organizational transformation. Would it be helpful if we used a systematic method that's specifically designed for navigating these kinds of adaptation challenges?"
-✅ "This sounds like an adaptation challenge. Want to try a method designed for handling workplace changes?"
-When Moving Through Phases:
-❌ "You've already demonstrated excellent awareness by identifying what's changing in your environment, which is actually the first part of the framework called SPOT. Now we're going to move into the THINK phase where we work on reframing your perspective about this challenge."
-✅ "You've done SPOT well - you see what's changing. Now let's work on THINK - reframing how you see this."
-When Ending:
-❌ "You've successfully worked through the complete STEP framework including all four phases: SPOT where you identified the changes, THINK where you reframed your perspective, ENGAGE where you identified concrete actions, and PERFORM where you planned how to measure and learn from your results."
-✅ "You've worked through the full STEP approach. You can use this same method for any workplace changes."
-Example Conversation (Concise & Natural)
 User: "my boss keeps giving me work right when i'm about to leave"
 AI: "That's super frustrating. Does this happen a lot?"
-User: "yeah like every single day"
 AI: "Sounds like a pattern. What's the main issue for you - the extra work or the timing?"
-User: "the timing, i never know when my day actually ends"
 AI: "That uncertainty would stress anyone out. I can't help change your boss's timing, but I can help you manage the stress this creates. Want to try that?"
-User: "yeah"
 AI: "It's called the 4Rs framework. You've already done RECOGNIZE - you know this pattern triggers stress. Now REGULATE - when they hand you work at 5pm, what could help you stay calm?"
-User: "maybe just accept it's going to happen?"
+AI: "maybe just accept it's going to happen?"
 AI: "Right, expecting it instead of being surprised. Now RESPECT - why might your boss do this?"
-User: "probably they're disorganized or have stuff come up last minute"
+AI: "probably they're disorganized or have stuff come up last minute"
 AI: "Probably not personal to you. REFLECT - what boundary could you test, like 'I can start on this tomorrow morning'?"
-User: "i could try that"
+AI: "i could try that"
 AI: "You've used the full 4Rs approach. Use it anytime you're managing difficult work situations."
 Key Reminders
 Be brief - pretend you're texting, not writing emails
@@ -223,7 +198,7 @@ QUESTION: {question}
 ANSWER:
 </s>[INST]
 """
-# If you prefer to keep the full, exact prompt, replace the placeholder above with your original prompt string
+
 from langchain.prompts import PromptTemplate as LCPromptTemplate
 prompt = LCPromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
 
@@ -283,16 +258,115 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
     conversation_memory[user_id] = history
     return answer
 
-# --- Helpers for audio download, conversion, transcription ---
-def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30) -> None:
-    logger.debug("Downloading media from %s to %s (auth=%s)", url, dest_path, bool(auth))
-    resp = requests.get(url, auth=auth, stream=True, timeout=timeout)
-    resp.raise_for_status()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(10240):
-            if chunk:
-                f.write(chunk)
-    logger.debug("Saved media to %s (%d bytes)", dest_path, os.path.getsize(dest_path))
+# --- Robust helpers for audio download, conversion, transcription ---
+
+def _basic_auth_header(auth: tuple):
+    if not auth:
+        return {}
+    user, passwd = auth
+    token = base64.b64encode(f"{user}:{passwd}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30):
+    """
+    Multi-strategy media downloader:
+     - try unauthenticated GET (some providers return public link)
+     - try GET with Authorization header preserved across redirects
+     - manual redirect-follow with requests.get(..., auth=auth) on each hop
+     - try Twilio /Content endpoint fallback
+    Raises requests.HTTPError on failure.
+    """
+    logger.debug("download_media called for %s (auth=%s)", url, bool(auth))
+
+    # Strategy 1: simple unauthenticated GET (useful for Meta or public CDN links)
+    try:
+        r = requests.get(url, stream=True, timeout=10, allow_redirects=True)
+        logger.debug("Unauthenticated fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
+        if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(10240):
+                    if chunk:
+                        f.write(chunk)
+            logger.debug("Saved media via unauthenticated fetch (%d bytes)", os.path.getsize(dest_path))
+            return
+    except Exception as e:
+        logger.debug("Unauthenticated fetch failed: %s", e)
+
+    # Strategy 2: GET with Basic Authorization header attached (some CDNs accept header)
+    if auth:
+        headers = _basic_auth_header(auth)
+        try:
+            r = requests.get(url, headers=headers, stream=True, timeout=15, allow_redirects=True)
+            logger.debug("Auth-header fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
+            if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(10240):
+                        if chunk:
+                            f.write(chunk)
+                logger.debug("Saved media via auth-header fetch (%d bytes)", os.path.getsize(dest_path))
+                return
+            else:
+                logger.warning("Auth-header fetch returned non-2xx: %s. body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
+        except Exception as e:
+            logger.debug("Auth-header fetch failed: %s", e)
+
+    # Strategy 3: manual redirect-follow with auth on each hop (preserve HTTP Basic auth)
+    if auth:
+        try:
+            current = url
+            hops = 0
+            max_hops = 8
+            while hops < max_hops:
+                logger.debug("Manual-auth hop %s -> %s", hops, current)
+                r = requests.get(current, auth=auth, stream=True, timeout=15, allow_redirects=False)
+                logger.debug("  status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
+                if 200 <= r.status_code < 300:
+                    with open(dest_path, "wb") as f:
+                        for chunk in r.iter_content(10240):
+                            if chunk:
+                                f.write(chunk)
+                    logger.debug("Saved media via manual-auth fetch (%d bytes)", os.path.getsize(dest_path))
+                    return
+                if r.is_redirect or r.is_permanent_redirect:
+                    loc = r.headers.get("Location") or r.headers.get("location")
+                    if not loc:
+                        r.raise_for_status()
+                    parsed = urlparse(loc)
+                    if not parsed.scheme:
+                        current = requests.compat.urljoin(current, loc)
+                    else:
+                        current = loc
+                    hops += 1
+                    continue
+                logger.warning("Manual-auth fetch non-2xx and not redirect: status=%s body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
+                r.raise_for_status()
+        except Exception as e:
+            logger.exception("Manual-auth fetch failed: %s", e)
+
+    # Strategy 4: Twilio media Content endpoint fallback (append /Content)
+    try:
+        parsed = urlparse(url)
+        if "api.twilio.com" in parsed.netloc and auth:
+            alt = url
+            if not parsed.path.endswith("/Content"):
+                alt = f"{url}/Content"
+            logger.debug("Trying Twilio Content endpoint: %s", alt)
+            r = requests.get(alt, auth=auth, stream=True, timeout=15, allow_redirects=True)
+            logger.debug("Twilio Content fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
+            if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(10240):
+                        if chunk:
+                            f.write(chunk)
+                logger.debug("Saved media via Twilio Content endpoint (%d bytes)", os.path.getsize(dest_path))
+                return
+            else:
+                logger.warning("Twilio Content fetch failed status=%s body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
+    except Exception as e:
+        logger.debug("Twilio Content endpoint attempt failed: %s", e)
+
+    # All strategies exhausted -> raise
+    raise requests.HTTPError(f"All media fetch strategies failed for {url}")
 
 def convert_to_mp3(input_path: str, output_path: str) -> None:
     logger.debug("Converting %s -> %s using ffmpeg", input_path, output_path)
@@ -347,7 +421,7 @@ def should_react_with_heart(user_input: str) -> bool:
 def send_meta_text(to_number: str, text: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
     payload = {"messaging_product": "whatsapp", "to": to_number, "text": {"body": text}}
-    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
     resp = requests.post(url, json=payload, headers=headers)
     try:
         resp.raise_for_status()
@@ -383,7 +457,7 @@ def send_meta_interactive_tone_choice(to_number: str):
 # --- Flask app ---
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
-validator = RequestValidator(TWILIO_AUTH) if TWILIO_AUTH else None
+validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -407,7 +481,16 @@ def whatsapp_webhook():
         if num_media > 0:
             media_url = request.form.get("MediaUrl0")
             media_ct = request.form.get("MediaContentType0", "")  # e.g. audio/ogg, audio/mpeg
-            # map common content-types to extensions
+            logger.debug("Incoming Twilio media: url=%s content-type=%s", media_url, media_ct)
+
+            # quick account-match diagnostic: ensure media_url account matches TWILIO_ACCOUNT_SID
+            try:
+                if media_url and TWILIO_ACCOUNT_SID and f"/Accounts/{TWILIO_ACCOUNT_SID}/" not in media_url:
+                    logger.warning("Media URL account mismatch: media_url=%s, expected account sid=%s", media_url, TWILIO_ACCOUNT_SID)
+            except Exception:
+                logger.debug("Skipping account match check due to parse error")
+
+            # map content-type to extension
             ext = ".bin"
             if "ogg" in media_ct or "opus" in media_ct:
                 ext = ".ogg"
@@ -415,14 +498,21 @@ def whatsapp_webhook():
                 ext = ".mp3"
             elif "wav" in media_ct:
                 ext = ".wav"
+
             try:
                 with tempfile.TemporaryDirectory() as tmpdir:
                     raw_path = os.path.join(tmpdir, f"incoming_media{ext}")
-                    # Twilio media URLs often require HTTP Basic auth with account SID and auth token
-                    auth_tuple = None
-                    if TWILIO_SID and TWILIO_AUTH:
-                        auth_tuple = (TWILIO_SID, TWILIO_AUTH)
-                    download_media(media_url, raw_path, auth=auth_tuple)
+
+                    acct = TWILIO_ACCOUNT_SID.strip() if TWILIO_ACCOUNT_SID else ""
+                    token = TWILIO_AUTH_TOKEN.strip() if TWILIO_AUTH_TOKEN else ""
+                    auth_tuple = (acct, token) if (acct and token) else None
+
+                    logger.info("Media fetch will attempt auth=%s, account_sid_present=%s", bool(auth_tuple), bool(acct))
+
+                    # Use robust multi-strategy downloader
+                    download_media(media_url, raw_path, auth=auth_tuple, timeout=30)
+
+                    # transcription attempts
                     transcription = transcribe_with_openai(raw_path)
                     if not transcription:
                         mp3_path = os.path.join(tmpdir, "converted.mp3")
@@ -432,11 +522,15 @@ def whatsapp_webhook():
                         except subprocess.CalledProcessError as cpe:
                             logger.exception("ffmpeg conversion failed: %s", cpe)
                     user_input = transcription or "[voice message received but could not transcribe]"
+
                     if DEBUG_SAVE_MEDIA:
                         save_dest = os.path.join(os.getcwd(), f"debug_media_{os.path.basename(raw_path)}")
                         with open(raw_path, "rb") as rfh, open(save_dest, "wb") as wfh:
                             wfh.write(rfh.read())
                         logger.info("Saved debug media to %s", save_dest)
+            except requests.HTTPError as http_err:
+                logger.exception("HTTP error processing incoming media: %s", http_err)
+                user_input = "[error processing voice message - media fetch failed]"
             except Exception as e:
                 logger.exception("Error processing incoming media: %s", e)
                 user_input = "[error processing voice message]"
@@ -509,9 +603,8 @@ def meta_webhook():
                                     logger.exception("Error sending interactive tone choice")
                                 continue
 
-                        # audio/voice handling
+                        # audio/voice handling (Meta)
                         elif msg.get("type") in ("audio", "voice"):
-                            # Meta Graph: fetch media object to get the URL
                             try:
                                 media_obj = msg.get(msg["type"], {})  # contains id
                                 media_id = media_obj.get("id")
@@ -521,17 +614,11 @@ def meta_webhook():
                                     media_resp = requests.get(media_url_fetch, params=params, timeout=15)
                                     media_resp.raise_for_status()
                                     media_json = media_resp.json()
-                                    media_link = media_json.get("url") or media_json.get("secure_url")
-                                    if not media_link:
-                                        # older Graph responses sometimes return a 'data' object with 'url'
-                                        media_link = media_json.get("data", {}).get("url")
+                                    media_link = media_json.get("url") or media_json.get("secure_url") or media_json.get("data", {}).get("url")
                                     if media_link:
                                         with tempfile.TemporaryDirectory() as tmpdir:
                                             raw_path = os.path.join(tmpdir, "voice_input")
-                                            # determine extension from content-type header if possible
-                                            # fetch the media binary
-                                            download_media(media_link, raw_path)
-                                            # try transcription; convert if needed
+                                            download_media(media_link, raw_path)  # Meta link usually doesn't need Twilio auth
                                             transcription = transcribe_with_openai(raw_path)
                                             if not transcription:
                                                 mp3_path = os.path.join(tmpdir, "voice.mp3")
