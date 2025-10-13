@@ -1,9 +1,10 @@
-# app.py (updated: Meta-only interactive template for tone selection + tone-aware replies)
+# app.py (updated + improved media handling, logging, and fallbacks)
 import os
 import tempfile
 import subprocess
 import requests
 import traceback
+import logging
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -20,36 +21,50 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "true").lower() == "true"
 DEBUG_SAVE_MEDIA = os.getenv("DEBUG_SAVE_MEDIA", "false").lower() == "true"
 
-# Meta WhatsApp Cloud env
+# Meta WhatsApp cloud env
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "stepbot_verify")
 META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
+
+# logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("whatsapp-bot")
 
 # --- OpenAI client (v1+) ---
 openai_client = None
 try:
     from openai import OpenAI
+
     if OPENAI_API_KEY:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
     else:
         openai_client = OpenAI()
+    logger.info("OpenAI client initialized")
 except Exception as e:
-    print("Could not initialize OpenAI v1 client:", repr(e))
+    logger.exception("Could not initialize OpenAI v1 client: %s", e)
     openai_client = None
 
-# --- RAG pipeline setup ---
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+# --- RAG pipeline setup (langchain + vectorstore) ---
+try:
+    from langchain_community.vectorstores import FAISS
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    from langchain.prompts import PromptTemplate
+    from langchain_openai import ChatOpenAI
+    from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-# Vector store / retriever
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
-db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
+    db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    logger.info("Vector store loaded")
+except Exception as e:
+    logger.exception("Error initializing vector store or langchain modules: %s", e)
+    # allow rest of app to run even if RAG setup failed
+    embeddings = None
+    db = None
+    db_retriever = None
 
 # Prompt template
 prompt_template = """
@@ -208,35 +223,50 @@ QUESTION: {question}
 ANSWER:
 </s>[INST]
 """
-prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
+# If you prefer to keep the full, exact prompt, replace the placeholder above with your original prompt string
+from langchain.prompts import PromptTemplate as LCPromptTemplate
+prompt = LCPromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
 
-# LLM + chains
-llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
-contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
-contextualize_q_prompt = ChatPromptTemplate.from_messages(
-    [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-)
-history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
+# LLM + chains (guarded)
+try:
+    llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
+    contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    )
+    history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
 
-qa_system_text = prompt_template.replace("{question}", "{input}")
-qa_chat_prompt = ChatPromptTemplate.from_messages(
-    [("system", qa_system_text), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-)
-question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
-qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    qa_system_text = prompt_template.replace("{question}", "{input}")
+    qa_chat_prompt = ChatPromptTemplate.from_messages(
+        [("system", qa_system_text), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
+    qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    logger.info("LLM and retrieval chain initialized")
+except Exception as e:
+    logger.exception("Error initializing LLM or chains: %s", e)
+    llm = None
+    qa = None
 
 # Conversation memory and tone preferences
 conversation_memory = {}
 tone_preferences = {}  # maps user_id -> "professional" | "casual"
 
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
-    # Inject tone into the model input so replies respect the selected tone (if any)
     tone = tone_preferences.get(user_id)
     effective_input = user_input
     if tone:
         effective_input = f"[TONE: {tone}]\n{user_input}"
     chat_history_for_chain = conversation_memory.get(user_id, [])
-    result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
+    try:
+        if qa:
+            result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
+        else:
+            result = {"answer": "Sorry, the assistant is temporarily unavailable."}
+    except Exception as e:
+        logger.exception("Error invoking QA chain: %s", e)
+        result = {"answer": "Sorry, something went wrong while processing your request."}
+
     answer = (
         result.get("answer")
         or result.get("output_text")
@@ -245,6 +275,7 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
         if isinstance(result, dict)
         else (result if isinstance(result, str) else str(result))
     )
+
     history = chat_history_for_chain[:] if chat_history_for_chain else []
     history += [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
     if len(history) > 20:
@@ -254,33 +285,44 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
 
 # --- Helpers for audio download, conversion, transcription ---
 def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30) -> None:
+    logger.debug("Downloading media from %s to %s (auth=%s)", url, dest_path, bool(auth))
     resp = requests.get(url, auth=auth, stream=True, timeout=timeout)
     resp.raise_for_status()
     with open(dest_path, "wb") as f:
         for chunk in resp.iter_content(10240):
             if chunk:
                 f.write(chunk)
+    logger.debug("Saved media to %s (%d bytes)", dest_path, os.path.getsize(dest_path))
 
 def convert_to_mp3(input_path: str, output_path: str) -> None:
+    logger.debug("Converting %s -> %s using ffmpeg", input_path, output_path)
     cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", "-b:a", "128k", output_path]
     subprocess.run(cmd, check=True)
+    logger.debug("Conversion complete: %s", output_path)
 
 def transcribe_with_openai(audio_file_path: str) -> str:
     if not openai_client:
+        logger.warning("OpenAI client not available for transcription")
         return ""
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai_client.audio.transcriptions.create(model="gpt-4o-transcribe", file=fh)
         text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
-        if text: return text
-    except Exception:
-        pass
+        if text:
+            logger.debug("Transcription (gpt-4o-transcribe) succeeded")
+            return text
+    except Exception as e:
+        logger.debug("gpt-4o-transcribe failed or unavailable: %s", e)
+
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
         text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
+        if text:
+            logger.debug("Transcription (whisper-1) succeeded")
         return text or ""
-    except Exception:
+    except Exception as e:
+        logger.exception("Whisper transcription failed: %s", e)
         return ""
 
 # --- Meta WhatsApp helpers ---
@@ -296,7 +338,7 @@ def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_nu
     headers = {"Authorization": f"Bearer {access_token}"}
     resp = requests.post(url, json=payload, headers=headers)
     resp.raise_for_status()
-    print(f"Sent reaction {emoji} to {to_number} for message {message_id}")
+    logger.debug("Sent reaction %s to %s for message %s", emoji, to_number, message_id)
 
 def should_react_with_heart(user_input: str) -> bool:
     triggers = ["hi", "hello", "hey", "my name is"]
@@ -310,7 +352,7 @@ def send_meta_text(to_number: str, text: str):
     try:
         resp.raise_for_status()
     except Exception as e:
-        print("Error sending meta text:", resp.status_code, resp.text, e)
+        logger.exception("Error sending meta text: %s -- response: %s", e, resp.text if resp is not None else None)
     return resp
 
 def send_meta_interactive_tone_choice(to_number: str):
@@ -335,7 +377,7 @@ def send_meta_interactive_tone_choice(to_number: str):
     try:
         resp.raise_for_status()
     except Exception as e:
-        print("Error sending meta interactive:", resp.status_code, resp.text, e)
+        logger.exception("Error sending meta interactive: %s -- response: %s", e, resp.text if resp is not None else None)
     return resp
 
 # --- Flask app ---
@@ -350,42 +392,71 @@ def health():
 # --- Twilio Webhook ---
 @app.route("/whatsapp-webhook", methods=["POST"])
 def whatsapp_webhook():
-    if validator and TWILIO_VALIDATE:
-        signature = request.headers.get("X-Twilio-Signature", "")
-        if not validator.validate(request.url, request.form, signature):
-            return ("Invalid signature", 403)
+    try:
+        if validator and TWILIO_VALIDATE:
+            signature = request.headers.get("X-Twilio-Signature", "")
+            if not validator.validate(request.url, request.form, signature):
+                logger.warning("Invalid Twilio signature")
+                return ("Invalid signature", 403)
 
-    from_number = request.form.get("From", "anonymous")
-    incoming_msg = (request.form.get("Body") or "").strip()
-    num_media = int(request.form.get("NumMedia", "0"))
+        from_number = request.form.get("From", "anonymous")
+        incoming_msg = (request.form.get("Body") or "").strip()
+        num_media = int(request.form.get("NumMedia", "0"))
 
-    user_input = None
-    if num_media > 0:
-        media_url = request.form.get("MediaUrl0")
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                raw_path = os.path.join(tmpdir, "incoming_media")
-                download_media(media_url, raw_path)
-                transcription = transcribe_with_openai(raw_path)
-                if not transcription:
-                    mp3_path = os.path.join(tmpdir, "converted.mp3")
-                    convert_to_mp3(raw_path, mp3_path)
-                    transcription = transcribe_with_openai(mp3_path)
-                user_input = transcription or "[voice message received but could not transcribe]"
-        except Exception:
-            user_input = "[error processing voice message]"
-    else:
-        user_input = incoming_msg
+        user_input = None
+        if num_media > 0:
+            media_url = request.form.get("MediaUrl0")
+            media_ct = request.form.get("MediaContentType0", "")  # e.g. audio/ogg, audio/mpeg
+            # map common content-types to extensions
+            ext = ".bin"
+            if "ogg" in media_ct or "opus" in media_ct:
+                ext = ".ogg"
+            elif "mpeg" in media_ct or "mp3" in media_ct:
+                ext = ".mp3"
+            elif "wav" in media_ct:
+                ext = ".wav"
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    raw_path = os.path.join(tmpdir, f"incoming_media{ext}")
+                    # Twilio media URLs often require HTTP Basic auth with account SID and auth token
+                    auth_tuple = None
+                    if TWILIO_ACCOUNT_SID and TWILIO_AUTH:
+                        auth_tuple = (TWILIO_ACCOUNT_SID, TWILIO_AUTH)
+                    download_media(media_url, raw_path, auth=auth_tuple)
+                    transcription = transcribe_with_openai(raw_path)
+                    if not transcription:
+                        mp3_path = os.path.join(tmpdir, "converted.mp3")
+                        try:
+                            convert_to_mp3(raw_path, mp3_path)
+                            transcription = transcribe_with_openai(mp3_path)
+                        except subprocess.CalledProcessError as cpe:
+                            logger.exception("ffmpeg conversion failed: %s", cpe)
+                    user_input = transcription or "[voice message received but could not transcribe]"
+                    if DEBUG_SAVE_MEDIA:
+                        save_dest = os.path.join(os.getcwd(), f"debug_media_{os.path.basename(raw_path)}")
+                        with open(raw_path, "rb") as rfh, open(save_dest, "wb") as wfh:
+                            wfh.write(rfh.read())
+                        logger.info("Saved debug media to %s", save_dest)
+            except Exception as e:
+                logger.exception("Error processing incoming media: %s", e)
+                user_input = "[error processing voice message]"
+        else:
+            user_input = incoming_msg
 
-    if not user_input:
+        if not user_input:
+            resp = MessagingResponse()
+            resp.message("👋 I didn’t receive any text. Please send a message.")
+            return str(resp), 200
+
+        reply = generate_reply_for_input(from_number, user_input)
         resp = MessagingResponse()
-        resp.message("👋 I didn’t receive any text. Please send a message.")
+        resp.message(reply)
         return str(resp), 200
-
-    reply = generate_reply_for_input(from_number, user_input)
-    resp = MessagingResponse()
-    resp.message(reply)
-    return str(resp), 200
+    except Exception as e:
+        logger.exception("Unhandled error in whatsapp_webhook: %s", e)
+        resp = MessagingResponse()
+        resp.message("Sorry, something went wrong processing your message.")
+        return str(resp), 500
 
 @app.route("/whatsapp-status", methods=["POST"])
 def whatsapp_status():
@@ -399,72 +470,91 @@ def meta_webhook():
         challenge = request.args.get("hub.challenge")
         verify_token = request.args.get("hub.verify_token")
         if mode == "subscribe" and verify_token == META_VERIFY_TOKEN:
-            print("META webhook verified!")
+            logger.info("META webhook verified!")
             return str(challenge), 200
         return "Verification token mismatch", 403
 
     try:
-        data = request.get_json()
-        print("Incoming Meta webhook:", data)
+        data = request.get_json(silent=True)
+        logger.debug("Incoming Meta webhook: %s", data)
+        if not data:
+            return jsonify({"status": "no data"}), 200
+
         if data.get("object") == "whatsapp_business_account":
             for entry in data.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
-                    messages = value.get("messages", [])
+                    messages = value.get("messages", []) or []
                     for msg in messages:
                         from_number = msg.get("from") or "anonymous"
                         message_id = msg.get("id")
                         user_input = None
 
-                        # Handle different incoming message types
+                        # text messages
                         if msg.get("type") == "text":
                             user_input = msg["text"]["body"].strip()
-                            # If initial greeting detected -> react with heart then interactive tone choice
                             if user_input.lower() in ("hi", "hello", "hey"):
                                 try:
-                                    # Prefer sending an actual WhatsApp reaction (heart) to the incoming message
                                     if message_id:
                                         send_whatsapp_reaction(
                                             from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
                                         )
                                     else:
-                                        # Fallback: send a short heart text if message_id is missing
                                         send_meta_text(from_number, "❤️")
-                                except Exception as e:
-                                    print("Error sending reaction on greeting:", e)
-                                # send interactive tone selection (Meta only)
+                                except Exception:
+                                    logger.exception("Error sending reaction on greeting")
                                 try:
                                     send_meta_interactive_tone_choice(from_number)
-                                except Exception as e:
-                                    print("Error sending interactive tone choice:", e)
-                                # do not proceed to LLM reply for this greeting message
+                                except Exception:
+                                    logger.exception("Error sending interactive tone choice")
                                 continue
 
-                        # audio/voice handling (existing flow)
+                        # audio/voice handling
                         elif msg.get("type") in ("audio", "voice"):
-                            media_id = msg[msg["type"]]["id"]
-                            # fetch media URL via Graph API (two-step)
+                            # Meta Graph: fetch media object to get the URL
                             try:
-                                media_url_fetch = f"https://graph.facebook.com/v17.0/{media_id}"
-                                headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
-                                media_resp = requests.get(media_url_fetch, headers=headers).json()
-                                media_link = media_resp.get("url")
-                                if media_link:
-                                    with tempfile.TemporaryDirectory() as tmpdir:
-                                        raw_path = os.path.join(tmpdir, "voice.ogg")
-                                        download_media(media_link, raw_path)
-                                        mp3_path = os.path.join(tmpdir, "voice.mp3")
-                                        convert_to_mp3(raw_path, mp3_path)
-                                        user_input = transcribe_with_openai(mp3_path)
-                            except Exception:
+                                media_obj = msg.get(msg["type"], {})  # contains id
+                                media_id = media_obj.get("id")
+                                if media_id:
+                                    media_url_fetch = f"https://graph.facebook.com/v17.0/{media_id}"
+                                    params = {"access_token": META_ACCESS_TOKEN, "fields": "url"}
+                                    media_resp = requests.get(media_url_fetch, params=params, timeout=15)
+                                    media_resp.raise_for_status()
+                                    media_json = media_resp.json()
+                                    media_link = media_json.get("url") or media_json.get("secure_url")
+                                    if not media_link:
+                                        # older Graph responses sometimes return a 'data' object with 'url'
+                                        media_link = media_json.get("data", {}).get("url")
+                                    if media_link:
+                                        with tempfile.TemporaryDirectory() as tmpdir:
+                                            raw_path = os.path.join(tmpdir, "voice_input")
+                                            # determine extension from content-type header if possible
+                                            # fetch the media binary
+                                            download_media(media_link, raw_path)
+                                            # try transcription; convert if needed
+                                            transcription = transcribe_with_openai(raw_path)
+                                            if not transcription:
+                                                mp3_path = os.path.join(tmpdir, "voice.mp3")
+                                                try:
+                                                    convert_to_mp3(raw_path, mp3_path)
+                                                    transcription = transcribe_with_openai(mp3_path)
+                                                except subprocess.CalledProcessError as cpe:
+                                                    logger.exception("ffmpeg conversion failed for meta media: %s", cpe)
+                                            user_input = transcription or "[voice message received but could not transcribe]"
+                                    else:
+                                        logger.warning("No media link returned for media id %s", media_id)
+                                        user_input = "[voice message received but could not fetch media]"
+                                else:
+                                    logger.warning("No media id found in message object: %s", msg)
+                                    user_input = "[voice message received but media id missing]"
+                            except Exception as e:
+                                logger.exception("Error fetching/transcribing meta audio: %s", e)
                                 user_input = "[voice message received but could not transcribe]"
 
-                        # Button / interactive reply handling (user chose Professional/Casual)
-                        # New: check for interactive button reply payloads
+                        # interactive payload (button replies)
                         interactive = msg.get("interactive")
                         if interactive:
                             i_type = interactive.get("type")
-                            # button_reply is common when user taps a reply button
                             if i_type == "button_reply":
                                 br = interactive.get("button_reply", {})
                                 button_id = br.get("id", "")
@@ -476,33 +566,29 @@ def meta_webhook():
                                     chosen_tone = "casual"
                                 if chosen_tone:
                                     tone_preferences[from_number] = chosen_tone
-                                    # acknowledge to user and prompt next step
                                     try:
                                         send_meta_text(
                                             from_number,
                                             f"Got it — I'll reply in a {chosen_tone.capitalize()} tone. How can I help today?",
                                         )
-                                    except Exception as e:
-                                        print("Error sending tone acknowledgement:", e)
-                                    # do not pass this interactive payload to LLM
+                                    except Exception:
+                                        logger.exception("Error sending tone acknowledgement")
                                     continue
 
-                        # If we still don't have user_input (e.g., non-greeting text or after audio)
                         if not user_input:
-                            # fallback for other types (e.g., locations, stickers) - skip
+                            # fallback skip (locations, stickers etc.)
                             user_input = None
 
                         if user_input:
-                            # --- React if needed ---
                             try:
                                 if should_react_with_heart(user_input):
-                                    send_whatsapp_reaction(
-                                        from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
-                                    )
-                            except Exception as e:
-                                print("Error sending reaction:", e)
+                                    if message_id:
+                                        send_whatsapp_reaction(
+                                            from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
+                                        )
+                            except Exception:
+                                logger.exception("Error sending reaction for user_input")
 
-                            # --- Generate LLM reply ---
                             reply_text = generate_reply_for_input(from_number, user_input)
                             send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
                             payload = {
@@ -513,16 +599,17 @@ def meta_webhook():
                             headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
                             try:
                                 resp = requests.post(send_url, json=payload, headers=headers)
-                                print("Meta reply sent:", resp.status_code, resp.text)
-                            except Exception as e:
-                                print("Error sending Meta reply:", e)
+                                logger.debug("Meta reply sent: %s -- %s", resp.status_code, resp.text)
+                            except Exception:
+                                logger.exception("Error sending Meta reply")
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        print("Error in Meta webhook:", e)
+        logger.exception("Error in Meta webhook: %s", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
