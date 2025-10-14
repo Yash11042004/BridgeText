@@ -490,6 +490,15 @@ def whatsapp_webhook():
             resp.message("👋 I didn’t receive any text. Please send a message.")
             return str(resp), 200
 
+        # If the user just sent a greeting (e.g., hi/hello) and it's not a problem statement, exchange greetings and ask how to help
+        if should_react_with_heart(user_input) and not is_problem_statement(user_input):
+            resp = MessagingResponse()
+            try:
+                resp.message("❤️ Hi! 👋 How can I help you today?")
+            except Exception:
+                logger.exception("Error sending Twilio greeting follow-up")
+            return str(resp), 200
+
         # If user was previously prompted for tone using Twilio, accept direct replies
         lower = user_input.lower().strip()
         if from_number in pending_tone_requests and lower in ("professional", "casual"):
@@ -563,6 +572,11 @@ def meta_webhook():
                                         send_meta_text(from_number, "❤️")
                                 except Exception:
                                     logger.exception("Error sending reaction on greeting")
+                                # Also send a friendly follow-up question to invite the user to describe their problem
+                                try:
+                                    send_meta_text(from_number, "Hi! 👋 How can I help you today?")
+                                except Exception:
+                                    logger.exception("Error sending greeting follow-up")
                                 # Do not send interactive tone choice on simple greeting — wait for a problem statement
                                 continue
 
